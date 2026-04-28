@@ -107,6 +107,14 @@ def auto_make_url(base, path):
     if b.endswith(p): return b
     return f"{b}/{p}" if re.search(r'/v\d+(/|$)', b) else f"{b}/v1/{p}"
 
+def _parse_claude_json(data):
+    content_blocks = data.get("content", [])
+    _record_usage(data.get("usage", {}), "messages")
+    for b in content_blocks:
+        if b.get("type") == "text": yield b.get("text", "")
+        elif b.get("type") == "thinking": yield ""
+    return content_blocks
+
 def _parse_claude_sse(resp_lines):
     """Parse Anthropic SSE stream. Yields text chunks, returns list[content_block]."""
     content_blocks = []; current_block = None; tool_json_buf = ""
@@ -174,7 +182,6 @@ def _parse_claude_sse(resp_lines):
         print(f"[WARN] {warn.strip()}")
         content_blocks.append({"type": "text", "text": warn}); yield warn
     return content_blocks
-
 
 def _try_parse_tool_args(raw):
     """Parse tool args string; split concatenated JSON objects like {..}{..} if needed.
@@ -342,9 +349,43 @@ def _stamp_oai_cache_markers(messages, model):
             c = list(c); c[-1] = dict(c[-1], cache_control={'type': 'ephemeral'})
             messages[idx] = {**messages[idx], 'content': c}
 
+def _stream_with_retry(sess, url, headers, payload, parse_fn):
+    _RETRYABLE = {408, 409, 425, 429, 500, 502, 503, 504, 529}
+    def _delay(resp, attempt):
+        try: ra = float((resp.headers or {}).get("retry-after"))
+        except: ra = None
+        return max(0.5, ra if ra is not None else min(30.0, 1.5 * (2 ** attempt)))
+    for attempt in range(sess.max_retries + 1):
+        streamed = False
+        try:
+            with requests.post(url, headers=headers, json=payload, stream=sess.stream, 
+                               timeout=(sess.connect_timeout, sess.read_timeout), proxies=sess.proxies, verify=sess.verify) as r:
+                if r.status_code >= 400:
+                    if r.status_code in _RETRYABLE and attempt < sess.max_retries:
+                        d = _delay(r, attempt)
+                        print(f"[LLM Retry] HTTP {r.status_code}, retry in {d:.1f}s ({attempt+1}/{sess.max_retries+1})")
+                        time.sleep(d); continue
+                    try: body = r.text.strip()[:500]
+                    except: body = ""
+                    err = f"!!!Error: HTTP {r.status_code}" + (f": {body}" if body else "")
+                    yield err; return [{"type": "text", "text": err}]
+                gen = parse_fn(r)
+                try:
+                    while True: streamed = True; yield next(gen)
+                except StopIteration as e: return e.value or []
+        except (requests.Timeout, requests.ConnectionError) as e:
+            if attempt < sess.max_retries and not streamed:
+                d = _delay(None, attempt)
+                print(f"[LLM Retry] {type(e).__name__}, retry in {d:.1f}s ({attempt+1}/{sess.max_retries+1})")
+                time.sleep(d); continue
+            err = f"!!!Error: {type(e).__name__}"
+            yield err; return [{"type": "text", "text": err}]
+        except Exception as e:
+            err = f"!!!Error: {type(e).__name__}: {e}"
+            yield err; return [{"type": "text", "text": err}]
+
 def _openai_stream(sess, messages):
-    """Shared OpenAI-compatible streaming request with retry. Yields text chunks, returns list[content_block]."""
-    model, api_mode, max_retries = sess.model, sess.api_mode, sess.max_retries
+    model, api_mode = sess.model, sess.api_mode
     ml = model.lower()
     temperature = sess.temperature
     if 'kimi' in ml or 'moonshot' in ml: temperature = 1
@@ -368,41 +409,8 @@ def _openai_stream(sess, messages):
     tools = getattr(sess, 'tools', None)
     if tools: payload["tools"] = _prepare_oai_tools(tools, api_mode)
     if sess.service_tier: payload["service_tier"] = sess.service_tier
-    RETRYABLE = {408, 409, 425, 429, 500, 502, 503, 504, 529}
-    def _delay(resp, attempt):
-        try: ra = float((resp.headers or {}).get("retry-after"))
-        except: ra = None
-        return max(0.5, ra if ra is not None else min(30.0, 1.5 * (2 ** attempt)))
-    for attempt in range(max_retries + 1):
-        streamed = False
-        try:
-            with requests.post(url, headers=headers, json=payload, stream=sess.stream,
-                               timeout=(sess.connect_timeout, sess.read_timeout), proxies=sess.proxies, verify=sess.verify) as r:
-                if r.status_code >= 400:
-                    if r.status_code in RETRYABLE and attempt < max_retries:
-                        d = _delay(r, attempt)
-                        print(f"[LLM Retry] HTTP {r.status_code}, retry in {d:.1f}s ({attempt+1}/{max_retries+1})")
-                        time.sleep(d); continue
-                    body = ""
-                    try: body = r.text.strip()[:500]
-                    except: pass
-                    err = f"!!!Error: HTTP {r.status_code}" + (f": {body}" if body else "")
-                    yield err; return [{"type": "text", "text": err}]
-                gen = _parse_openai_sse(r.iter_lines(), api_mode) if sess.stream else _parse_openai_json(r.json(), api_mode)
-                try:
-                    while True: streamed = True; yield next(gen)
-                except StopIteration as e:
-                    return e.value or []
-        except (requests.Timeout, requests.ConnectionError) as e:
-            if attempt < max_retries and not streamed:
-                d = _delay(None, attempt)
-                print(f"[LLM Retry] {type(e).__name__}, retry in {d:.1f}s ({attempt+1}/{max_retries+1})")
-                time.sleep(d); continue
-            err = f"!!!Error: {type(e).__name__}"
-            yield err; return [{"type": "text", "text": err}]
-        except Exception as e:
-            err = f"!!!Error: {type(e).__name__}: {e}"
-            yield err; return [{"type": "text", "text": err}]
+    parse_fn = (lambda r: _parse_openai_sse(r.iter_lines(), api_mode)) if sess.stream else (lambda r: _parse_openai_json(r.json(), api_mode))
+    return (yield from _stream_with_retry(sess, url, headers, payload, parse_fn))
         
 def _prepare_oai_tools(tools, api_mode="chat_completions"):
     if api_mode == "responses":
@@ -510,7 +518,7 @@ class BaseSession:
         proxy = cfg.get('proxy')
         self.proxies = {"http": proxy, "https": proxy} if proxy else None
         self.verify = cfg.get('verify', True)
-        self.max_retries = max(0, int(cfg.get('max_retries', 1)))
+        self.max_retries = max(0, int(cfg.get('max_retries', 4)))
         self.stream = cfg.get('stream', True)
         default_ct, default_rt = (5, 30) if self.stream else (10, 240)
         self.connect_timeout = max(1, int(cfg.get('timeout', default_ct)))
@@ -538,7 +546,7 @@ class BaseSession:
             effort = {'low': 'low', 'medium': 'medium', 'high': 'high', 'xhigh': 'max'}.get(self.reasoning_effort)
             if effort: payload["output_config"] = {"effort": effort}
             else: print(f"[WARN] reasoning_effort {self.reasoning_effort!r} is unsupported for Claude output_config.effort, ignored.")
-    def ask(self, prompt, stream=False):
+    def ask(self, prompt):
         def _ask_gen():
             with self.lock:
                 self.history.append({"role": "user", "content": [{"type": "text", "text": prompt}]})
@@ -555,7 +563,7 @@ class BaseSession:
                     tu = {'name': block.get('name', ''), 'arguments': block.get('input', {})}
                     yield f'<tool_use>{json.dumps(tu, ensure_ascii=False)}</tool_use>'
             if not content.startswith("!!!Error:"): self.history.append({"role": "assistant", "content": [{"type": "text", "text": content}]})
-        return _ask_gen() if stream else ''.join(list(_ask_gen()))
+        return _ask_gen() if self.stream else ''.join(list(_ask_gen()))
 
 def _keep_claude_block(b): return not isinstance(b, dict) or b.get("type") != "thinking" or b.get("signature")
 def _drop_unsigned_thinking(messages):
@@ -579,17 +587,13 @@ class ClaudeSession(BaseSession):
     def raw_ask(self, messages):
         if self.max_tokens is None: self.max_tokens = 8192
         headers = {"x-api-key": self.api_key, "Content-Type": "application/json", "anthropic-version": "2023-06-01", "anthropic-beta": "prompt-caching-2024-07-31"}
-        payload = {"model": self.model, "messages": messages, "max_tokens": self.max_tokens, "stream": True}
+        payload = {"model": self.model, "messages": messages, "max_tokens": self.max_tokens, "stream": self.stream}
         if self.temperature != 1: payload["temperature"] = self.temperature
         self._apply_claude_thinking(payload)
         if self.system: payload["system"] = [{"type": "text", "text": self.system, "cache_control": {"type": "persistent"}}]
-        try:
-            with requests.post(auto_make_url(self.api_base, "messages"), headers=headers, json=payload, stream=True, timeout=(self.connect_timeout, self.read_timeout), verify=self.verify) as r:
-                if r.status_code != 200: raise Exception(f"HTTP {r.status_code} {r.content.decode('utf-8', errors='replace')[:500]}")
-                return (yield from _parse_claude_sse(r.iter_lines())) or []
-        except Exception as e:
-            yield (err := f"!!!Error: {e}")
-            return [{"type": "text", "text": err}]
+        url = auto_make_url(self.api_base, "messages")
+        parse_fn = (lambda r: _parse_claude_sse(r.iter_lines())) if self.stream else (lambda r: _parse_claude_json(r.json()))
+        return (yield from _stream_with_retry(self, url, headers, payload, parse_fn))
     def make_messages(self, raw_list):
         msgs = _drop_unsigned_thinking([{"role": m['role'], "content": list(m['content'])} for m in raw_list])
         user_idxs = [i for i, m in enumerate(msgs) if m['role'] == 'user']
@@ -656,20 +660,9 @@ class NativeClaudeSession(BaseSession):
         for idx in user_idxs[-2:]:
             messages[idx] = {**messages[idx], "content": list(messages[idx]["content"])}
             messages[idx]["content"][-1] = dict(messages[idx]["content"][-1], cache_control={"type": "ephemeral"})
-        try:
-            with requests.post(auto_make_url(self.api_base, "messages")+'?beta=true', headers=headers, json=payload, stream=self.stream, timeout=(self.connect_timeout, self.read_timeout), verify=self.verify) as resp:
-                if resp.status_code != 200: raise Exception(f"HTTP {resp.status_code} {resp.content.decode('utf-8', errors='replace')[:500]}")
-                if self.stream: return (yield from _parse_claude_sse(resp.iter_lines())) or []
-                else:
-                    data = resp.json(); content_blocks = data.get("content", [])
-                    _record_usage(data.get("usage", {}), "messages")
-                    for b in content_blocks:
-                        if b.get("type") == "text": yield b.get("text", "")
-                        elif b.get("type") == "thinking": yield ""
-                    return content_blocks
-        except Exception as e:
-            yield (err := f"!!!Error: {e}")
-            return [{"type": "text", "text": err}]
+        url = auto_make_url(self.api_base, "messages") + '?beta=true'
+        parse_fn = (lambda r: _parse_claude_sse(r.iter_lines())) if self.stream else (lambda r: _parse_claude_json(r.json()))
+        return (yield from _stream_with_retry(self, url, headers, payload, parse_fn))
 
     def ask(self, msg):
         assert type(msg) is dict
@@ -714,7 +707,6 @@ def openai_tools_to_claude(tools):
             'input_schema': fn.get('parameters', {'type': 'object', 'properties': {}})})
     return result
 
-
 class MockFunction:
     def __init__(self, name, arguments): self.name, self.arguments = name, arguments  
          
@@ -743,7 +735,7 @@ class ToolClient:
         full_prompt = self._build_protocol_prompt(messages, tools)
         print("Full prompt length:", len(full_prompt), 'chars')
         prompt_log = full_prompt
-        gen = self.backend.ask(full_prompt, stream=True)
+        gen = self.backend.ask(full_prompt)
         _write_llm_log('Prompt', prompt_log)
         raw_text = ''; summarytag = '[NextWillSummary]'
         for chunk in gen:
@@ -915,7 +907,8 @@ class MixinSession:
         groups = {is_native(s) for s in self._sessions}
         assert len(groups) == 1, f"MixinSession: sessions must be in same group (Native or non-Native), got {[type(s).__name__ for s in self._sessions]}"
         self.name = '|'.join(s.name for s in self._sessions)
-        import copy; self._sessions[0] = copy.copy(self._sessions[0])
+        import copy; self._sessions = [copy.copy(s) for s in self._sessions]
+        for s in self._sessions: s.max_retries = 0
         self._orig_raw_asks = [s.raw_ask for s in self._sessions]
         self._sessions[0].raw_ask = self._raw_ask
         self.model = getattr(self._sessions[0], 'model', None)
@@ -950,6 +943,9 @@ class MixinSession:
             is_err = test_error(last_chunk)
             if not is_err:
                 if attempt > 0: self._cur_idx = idx; self._switched_at = time.time()
+                elif isinstance(last_chunk, str) and '[!!! 流异常中断' in last_chunk and n > 1:
+                    self._cur_idx = (idx + 1) % n; self._switched_at = time.time()
+                    print(f'[MixinSession] Partial failure, next call → s{self._cur_idx} ({self._sessions[self._cur_idx].name})')
                 return return_val
             if attempt >= self._retries:
                 yield last_chunk; return return_val
