@@ -87,6 +87,7 @@ if __name__ == '__main__':
     parser.add_argument('--feishu', '--fs', dest='feishu', action='store_true', help='启动 Feishu Bot');
     parser.add_argument('--wecom', action='store_true', help='启动 WeCom Bot');
     parser.add_argument('--dingtalk', '--dt', dest='dingtalk', action='store_true', help='启动 DingTalk Bot');
+    parser.add_argument('--fxiaoke', '--fx', dest='fxiaoke', action='store_true', help='启动纷享销客企信 Bot');
     parser.add_argument('--sched', action='store_true', help='启动计划任务调度器')
     parser.add_argument('--llm_no', type=int, default=0, help='LLM编号')
     args = parser.parse_args()
@@ -123,6 +124,12 @@ if __name__ == '__main__':
         atexit.register(dtproc.kill)
         print('[Launch] DingTalk Bot started')
     else: print('[Launch] DingTalk Bot not enabled (use --dingtalk to start)')
+
+    if args.fxiaoke:
+        fxproc = subprocess.Popen([sys.executable, os.path.join(frontends_dir, "fxiaokeapp.py")], creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
+        atexit.register(fxproc.kill)
+        print('[Launch] Fxiaoke Bot started')
+    else: print('[Launch] Fxiaoke Bot not enabled (use --fxiaoke to start)')
     
     if args.sched:
         scheduler_proc = subprocess.Popen([sys.executable, os.path.join(script_dir, "agentmain.py"), "--reflect", os.path.join(script_dir, "reflect", "scheduler.py"), "--llm_no", str(args.llm_no)], creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)

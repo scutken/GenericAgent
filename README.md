@@ -121,6 +121,24 @@ tg_allowed_users = [YOUR_USER_ID]
 python frontends/tgapp.py
 ```
 
+### ShareCRM Qixin Bot
+
+```python
+# mykey.py
+fxiaoke_base_url = 'https://open.fxiaoke.com'
+fxiaoke_app_id = 'YOUR_GATEWAY_APP_ID'
+fxiaoke_app_secret = 'YOUR_GATEWAY_APP_SECRET'
+fxiaoke_allowed_users = ['YOUR_FXIAOKE_USER_ID']  # optional; [] or ['*'] allows all users
+```
+
+```bash
+python frontends/fxiaokeapp.py
+# or launch together with desktop UI:
+python launch.pyw --fxiaoke
+# shorthand:
+python launch.pyw --fx
+```
+
 ### Alternative App Frontends
 
 Besides the default Streamlit web UI, you can also try other frontend styles:
@@ -409,6 +427,34 @@ dingtalk_client_id = "your_app_key"
 dingtalk_client_secret = "your_app_secret"
 dingtalk_allowed_users = ["your_staff_id"]  # 或 ['*']
 ```
+
+### 纷享销客企信助理
+
+通过纷享销客企信 IM Gateway 接入，让 GenericAgent 作为企信助理收发消息。
+
+在 `mykey.py` 中补充：
+
+```python
+fxiaoke_base_url = "https://open.fxiaoke.com"
+fxiaoke_app_id = "YOUR_GATEWAY_APP_ID"
+fxiaoke_app_secret = "YOUR_GATEWAY_APP_SECRET"
+fxiaoke_allowed_users = ["YOUR_FXIAOKE_USER_ID"]  # 可选；[] 或 ['*'] 允许全部用户
+```
+
+启动方式：
+
+```bash
+python frontends/fxiaokeapp.py
+# 或与桌面 UI 一起启动：
+python launch.pyw --fxiaoke
+# 简写也可：
+python launch.pyw --fx
+```
+
+说明：
+- 企信助理通过 SSE 拉取事件，并调用 IM Gateway 消息发送接口回复。
+- 如需限制访问，建议在 `fxiaoke_allowed_users` 中填写企信用户 ID；首次消息后的日志可在 `temp/fxiaokeapp.log` 中查看。
+- 排查连接或收发消息问题时，也可查看 `fxiaoke_launch.log` / `fxiaokeapp.log`。
 
 ### 其他 App 前端
 

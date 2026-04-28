@@ -416,6 +416,11 @@ native_oai_config = {
 # dingtalk_client_id = 'your_app_key'
 # dingtalk_client_secret = 'your_app_secret'
 # dingtalk_allowed_users = ['your_staff_id']        # 留空或 ['*'] 表示允许所有钉钉用户
+# fxiaoke_base_url = 'https://open.fxiaoke.com'     # 纷享销客企信 IM Gateway 地址
+# fxiaoke_app_id = 'your_gateway_app_id'
+# fxiaoke_app_secret = 'your_gateway_app_secret'
+# fxiaoke_allowed_users = ['your_fxiaoke_user_id']  # 留空或 ['*'] 表示允许所有企信用户
+# fxiaoke_event_version = '1.3.0'                   # SSE 协议版本，默认 1.3.0
 
 # 可选：Langfuse 追踪。不设此项则不 import langfuse，零影响
 # langfuse_config = {
