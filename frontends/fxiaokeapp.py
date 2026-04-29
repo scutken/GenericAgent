@@ -6,7 +6,7 @@ import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agentmain import GeneraticAgent
-from chatapp_common import AgentChatMixin, FILE_HINT, build_done_text, ensure_single_instance, public_access, redirect_log, require_runtime, split_text
+from chatapp_common import AgentChatMixin, FILE_HINT, clean_reply, ensure_single_instance, extract_files, public_access, redirect_log, require_runtime, split_text, strip_files
 from llmcore import mykeys
 
 # ── Config ──────────────────────────────────────────────────────────
@@ -92,6 +92,53 @@ def _strip_tool_traces(raw: str) -> str:
             return cleaned
 
     return clean_segment(text)
+
+
+def _norm_file_key(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _escape_md_inline(text: str) -> str:
+    return re.sub(r"([\\`*_{}\[\]()#+\-.!|])", r"\\\1", text or "")
+
+
+def _dedup_existing_generated_files(body: str, file_keys: set) -> str:
+    """Remove plain generated-file lines that duplicate the Markdown file block."""
+    kept = []
+    for line in (body or "").splitlines():
+        match = re.match(r"^\s*生成文件:\s*(.+?)\s*$", line)
+        if match and _norm_file_key(match.group(1).strip()) in file_keys:
+            continue
+        kept.append(line)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+
+
+def build_fxiaoke_done_text(raw_text: str) -> str:
+    """Build final Fxiaoke answer with Markdown-friendly file references."""
+    files = []
+    seen = set()
+    for path in extract_files(raw_text):
+        if not os.path.exists(path):
+            continue
+        key = _norm_file_key(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        files.append(path)
+
+    body = strip_files(clean_reply(raw_text))
+    if files:
+        body = _dedup_existing_generated_files(body, seen)
+        lines = ["### 生成文件"]
+        for idx, path in enumerate(files, 1):
+            name = os.path.basename(path) or path
+            lines.append(f"{idx}. **{_escape_md_inline(name)}**")
+            lines.append("   ```text")
+            lines.append(f"   {path}")
+            lines.append("   ```")
+        body = (body + "\n\n" if body else "") + "\n".join(lines)
+    return body or "..."
+
 
 agent = GeneraticAgent()
 agent.verbose = False
@@ -263,7 +310,7 @@ class FxiaokeApp(AgentChatMixin):
                             sent_turn_actions.add(turn)
                             last_ping = time.time()
                 if "done" in item:
-                    await self.send_text(chat_id, build_done_text(_strip_tool_traces(item.get("done", ""))), **ctx)
+                    await self.send_text(chat_id, build_fxiaoke_done_text(_strip_tool_traces(item.get("done", ""))), **ctx)
                     break
             if not state["running"]:
                 await self.send_text(chat_id, "⏹️ 已停止", **ctx)

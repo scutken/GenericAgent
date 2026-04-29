@@ -193,10 +193,24 @@ def format_restore():
 
 
 def build_done_text(raw_text):
-    files = [p for p in extract_files(raw_text) if os.path.exists(p)]
+    files = []
+    seen = set()
+    for p in extract_files(raw_text):
+        if not os.path.exists(p):
+            continue
+        key = os.path.normcase(os.path.abspath(p))
+        if key in seen:
+            continue
+        seen.add(key)
+        files.append(p)
+
     body = strip_files(clean_reply(raw_text))
     if files:
-        body = (body + "\n\n" if body else "") + "\n".join(f"生成文件: {p}" for p in files)
+        existing = {m.group(1).strip() for m in re.finditer(r"(?m)^生成文件:\s*(.+?)\s*$", body or "")}
+        existing_keys = {os.path.normcase(os.path.abspath(p)) for p in existing}
+        new_lines = [f"生成文件: {p}" for p in files if os.path.normcase(os.path.abspath(p)) not in existing_keys]
+        if new_lines:
+            body = (body + "\n\n" if body else "") + "\n".join(new_lines)
     return body or "..."
 
 
