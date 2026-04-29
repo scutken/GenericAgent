@@ -4,6 +4,17 @@ WINDOW_WIDTH, WINDOW_HEIGHT, RIGHT_PADDING, TOP_PADDING = 600, 900, 0, 100
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 frontends_dir = os.path.join(script_dir, "frontends")
+APP_ICON = os.path.join(script_dir, "assets", "images", "logo.ico")
+APP_ID = "GenericAgent.Launcher"
+
+def configure_windows_taskbar_icon():
+    """Ensure Windows taskbar uses the app icon instead of python's default/blank icon."""
+    if os.name != 'nt':
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+    except Exception as e:
+        print(f'[Launch] Failed to set AppUserModelID: {e}')
 
 def find_free_port(lo=18501, hi=18599):
     ports = list(range(lo, hi+1)); random.shuffle(ports)
@@ -91,6 +102,7 @@ if __name__ == '__main__':
     parser.add_argument('--sched', action='store_true', help='启动计划任务调度器')
     parser.add_argument('--llm_no', type=int, default=0, help='LLM编号')
     args = parser.parse_args()
+    configure_windows_taskbar_icon()
     port = str(find_free_port()) if args.port == '0' else args.port
     print(f'[Launch] Using port {port}')
     threading.Thread(target=start_streamlit, args=(port,), daemon=True).start()
@@ -148,4 +160,4 @@ if __name__ == '__main__':
         title='GenericAgent', url=f'http://localhost:{port}',
         width=WINDOW_WIDTH, height=WINDOW_HEIGHT, x=x_pos, y=TOP_PADDING,
         resizable=True, text_select=True)
-    webview.start()
+    webview.start(icon=APP_ICON if os.path.isfile(APP_ICON) else None)
