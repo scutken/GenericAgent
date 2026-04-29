@@ -1,4 +1,4 @@
-import asyncio, json, os, random, re, sys, threading, time
+import asyncio, json, os, queue as Q, random, re, sys, threading, time
 from typing import Dict, Optional
 from urllib.parse import urlencode
 
@@ -6,7 +6,7 @@ import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agentmain import GeneraticAgent
-from chatapp_common import AgentChatMixin, ensure_single_instance, public_access, redirect_log, require_runtime, split_text
+from chatapp_common import AgentChatMixin, FILE_HINT, build_done_text, ensure_single_instance, public_access, redirect_log, require_runtime, split_text
 from llmcore import mykeys
 
 # ── Config ──────────────────────────────────────────────────────────
@@ -58,6 +58,40 @@ def _strip_bot_mentions(content: str) -> str:
     if text.startswith("/"):
         text = re.sub(r"\s+@[^\s@]+\s*$", "", text).strip()
     return text
+
+
+def _strip_tool_traces(raw: str) -> str:
+    """Keep the final user-facing answer; drop internal turn/tool traces.
+
+    agentmain returns the accumulated stream in the done item.  For chat apps
+    this includes per-turn "LLM Running" markers and compact tool-call lines
+    such as "🛠️ file_read(...)".  Fxiaoke already sends tool actions as
+    separate progress messages, so the final message must contain only the last
+    assistant answer.
+    """
+    text = raw or ""
+    turn_re = re.compile(r"(?:\*\*)?LLM Running \(Turn \d+\) \.\.\.(?:\*\*)?\s*", re.MULTILINE)
+    parts = [p.strip() for p in turn_re.split(text) if p.strip()]
+
+    def clean_segment(segment: str) -> str:
+        segment = re.sub(
+            r"^\s*🛠️\s*Tool:\s*`?[^`\n]+`?\s*📥 args:\s*\n````[\s\S]*?````\s*",
+            "",
+            segment,
+            flags=re.MULTILINE,
+        )
+        segment = re.sub(r"^\s*🛠️\s*[^\n]+\n*", "", segment, flags=re.MULTILINE)
+        return re.sub(r"\n{3,}", "\n\n", segment).strip()
+
+    # Prefer the last turn with visible assistant text; earlier turns are only
+    # progress/planning and are intentionally not part of the final answer.
+    for segment in reversed(parts or [text]):
+        cleaned = clean_segment(segment)
+        visible = re.sub(r"<summary>\s*.*?\s*</summary>", "", cleaned, flags=re.DOTALL).strip()
+        if visible:
+            return cleaned
+
+    return clean_segment(text)
 
 agent = GeneraticAgent()
 agent.verbose = False
@@ -166,6 +200,80 @@ class FxiaokeApp(AgentChatMixin):
             except Exception as e:
                 print(f"[Fxiaoke] send error: {e}")
                 break
+
+    async def run_agent(self, chat_id, text, **ctx):
+        state = {"running": True}
+        self.user_tasks[chat_id] = state
+        sent_turn_actions = set()
+        running_re = re.compile(r"(?:\*\*)?LLM Running \(Turn (\d+)\) \.\.\.(?:\*\*)?")
+        tool_re = re.compile(r"^🛠️(?: Tool:)?\s*`?([^`\n(]+)`?(?:\((.*?)\)|\s+📥 args:)?", re.MULTILINE)
+
+        def _strip_running_markers(raw):
+            text = running_re.sub("", raw or "")
+            text = re.sub(r"\n{3,}", "\n\n", text)
+            return text.strip()
+
+        def _turn_segments(raw):
+            raw = raw or ""
+            matches = list(running_re.finditer(raw))
+            for idx, match in enumerate(matches):
+                turn = int(match.group(1))
+                end = matches[idx + 1].start() if idx + 1 < len(matches) else len(raw)
+                yield turn, raw[match.end():end]
+
+        def _action_text(turn, segment):
+            actions = []
+            for m in tool_re.finditer(segment or ""):
+                name = (m.group(1) or "").strip()
+                args = (m.group(2) or "").strip()
+                if not name or name == "no_tool":
+                    continue
+                actions.append(f"🛠️ {name}" + (f"({args})" if args else ""))
+            if not actions:
+                return ""
+            deduped = list(dict.fromkeys(actions))
+            return f"第 {turn} 轮执行动作：\n" + "\n".join(deduped)
+
+        try:
+            await self.send_text(chat_id, "思考中...", **ctx)
+            dq = self.agent.put_task(f"{FILE_HINT}\n\n{text}", source=self.source)
+            last_ping = time.time()
+            seen_next = ""
+            while state["running"]:
+                try:
+                    item = await asyncio.to_thread(dq.get, True, 3)
+                except Q.Empty:
+                    if self.agent.is_running and time.time() - last_ping > self.ping_interval:
+                        await self.send_text(chat_id, "⏳ 还在处理中，请稍等...", **ctx)
+                        last_ping = time.time()
+                    continue
+                if "next" in item:
+                    chunk = str(item.get("next") or "")
+                    # agent.inc_out=True 时 next 是增量；False 时 next 是累计全文。两种都兼容。
+                    if chunk.startswith(seen_next):
+                        seen_next = chunk
+                    else:
+                        seen_next += chunk
+                    for turn, segment in _turn_segments(seen_next):
+                        if turn in sent_turn_actions:
+                            continue
+                        msg = _action_text(turn, segment)
+                        if msg:
+                            await self.send_text(chat_id, msg, **ctx)
+                            sent_turn_actions.add(turn)
+                            last_ping = time.time()
+                if "done" in item:
+                    await self.send_text(chat_id, build_done_text(_strip_tool_traces(item.get("done", ""))), **ctx)
+                    break
+            if not state["running"]:
+                await self.send_text(chat_id, "⏹️ 已停止", **ctx)
+        except Exception as e:
+            import traceback
+            print(f"[Fxiaoke] run_agent error: {e}")
+            traceback.print_exc()
+            await self.send_text(chat_id, f"❌ 错误: {e}", **ctx)
+        finally:
+            self.user_tasks.pop(chat_id, None)
 
     # ── SSE parsing ──────────────────────────────────────────────────
     def _parse_sse_stream(self, resp):
