@@ -517,8 +517,8 @@ class BaseSession:
         self.name = cfg.get('name', self.model)
         proxy = cfg.get('proxy')
         self.proxies = {"http": proxy, "https": proxy} if proxy else None
-        self.verify = cfg.get('verify', True)
         self.max_retries = max(0, int(cfg.get('max_retries', 4)))
+        self.verify = cfg.get('verify', True)
         self.stream = cfg.get('stream', True)
         default_ct, default_rt = (5, 30) if self.stream else (10, 240)
         self.connect_timeout = max(1, int(cfg.get('timeout', default_ct)))
@@ -736,15 +736,11 @@ class ToolClient:
     def chat(self, messages, tools=None):
         full_prompt = self._build_protocol_prompt(messages, tools)
         print("Full prompt length:", len(full_prompt), 'chars')
-        prompt_log = full_prompt
         gen = self.backend.ask(full_prompt)
-        _write_llm_log('Prompt', prompt_log)
-        raw_text = ''; summarytag = '[NextWillSummary]'
+        _write_llm_log('Prompt', full_prompt)
+        raw_text = ''
         for chunk in gen:
-            raw_text += chunk
-            if chunk != summarytag: yield chunk
-        if raw_text.endswith(summarytag):
-            self.last_tools = ''; raw_text = raw_text[:-len(summarytag)]
+            raw_text += chunk; yield chunk
         _write_llm_log('Response', raw_text)
         return self._parse_mixed_response(raw_text)
 
@@ -827,8 +823,7 @@ Follow these steps to think and act:
                 except: pass
             if not tool_calls:
                 for e in errors:
-                    print(f"[Warn] {e}")
-                    tool_calls.append(MockToolCall('bad_json', {'msg': e}))
+                    print(f"[Warn] {e}"); tool_calls.append(MockToolCall('bad_json', {'msg': e}))
         return MockResponse(thinking, remaining_text.strip(), tool_calls, text)
 
 def _parse_text_tool_calls(content):
@@ -985,4 +980,3 @@ class NativeToolClient:
         if resp: _write_llm_log('Response', resp.raw)
         if resp and hasattr(resp, 'tool_calls') and resp.tool_calls: self._pending_tool_ids = [tc.id for tc in resp.tool_calls]
         return resp
-
