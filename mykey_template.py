@@ -420,6 +420,7 @@ native_oai_config = {
 # fxiaoke_app_id = 'your_gateway_app_id'
 # fxiaoke_app_secret = 'your_gateway_app_secret'
 # fxiaoke_allowed_users = ['your_fxiaoke_user_id']  # 留空或 ['*'] 表示允许所有企信用户
+# fxiaoke_bot_names = ['your_bot_display_name']     # 可选；群聊命令中自动剥离 @机器人 名称
 # fxiaoke_event_version = '1.3.0'                   # SSE 协议版本，默认 1.3.0
 
 # 可选：Langfuse 追踪。不设此项则不 import langfuse，零影响

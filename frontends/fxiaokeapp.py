@@ -1,4 +1,4 @@
-import asyncio, json, os, random, sys, threading, time
+import asyncio, json, os, random, re, sys, threading, time
 from typing import Dict, Optional
 from urllib.parse import urlencode
 
@@ -17,6 +17,47 @@ ALLOWED = {str(x).strip() for x in mykeys.get("fxiaoke_allowed_users", []) if st
 EVENT_VERSION = str(mykeys.get("fxiaoke_event_version", "1.3.0") or "1.3.0").strip()
 CONNECT_TIMEOUT = int(mykeys.get("fxiaoke_connect_timeout", 15) or 15)
 READ_TIMEOUT = int(mykeys.get("fxiaoke_read_timeout", 90) or 90)
+BOT_MENTION_NAMES = {str(x).strip().lstrip("@").casefold() for x in mykeys.get("fxiaoke_bot_names", []) if str(x).strip()}
+
+MENTION_RE = re.compile(r"@[^\s@]+")
+
+
+def _strip_bot_mentions(content: str) -> str:
+    """Remove Fxiaoke group-chat bot mentions so slash commands are parsed.
+
+    Fxiaoke may deliver group messages as either "@Bot /cmd" or
+    "/cmd @Bot".  The gateway event currently does not expose a stable bot
+    display name, so configured names are stripped precisely; otherwise we
+    only strip the edge mention when doing so reveals a slash command.
+    """
+    text = (content or "").strip()
+    if not text:
+        return ""
+
+    def is_configured_bot(match: re.Match) -> bool:
+        return match.group(0).lstrip("@").casefold() in BOT_MENTION_NAMES
+
+    # Always remove configured bot mentions at message edges.
+    changed = True
+    while BOT_MENTION_NAMES and changed:
+        changed = False
+        m = MENTION_RE.match(text)
+        if m and is_configured_bot(m):
+            text = text[m.end():].strip()
+            changed = True
+        m = list(MENTION_RE.finditer(text))[-1:] if text else []
+        if m and m[0].end() == len(text) and is_configured_bot(m[0]):
+            text = text[:m[0].start()].strip()
+            changed = True
+
+    # Heuristic fallback for group bot commands: mention may be prepended or
+    # appended to a slash command, e.g. "@阿乖-GA /help" or "/help @阿乖-GA".
+    m = MENTION_RE.match(text)
+    if m and text[m.end():].lstrip().startswith("/"):
+        text = text[m.end():].strip()
+    if text.startswith("/"):
+        text = re.sub(r"\s+@[^\s@]+\s*$", "", text).strip()
+    return text
 
 agent = GeneraticAgent()
 agent.verbose = False
@@ -227,6 +268,7 @@ class FxiaokeApp(AgentChatMixin):
             message_id = data.get("message_id")
             msg_obj = data.get("message") if isinstance(data.get("message"), dict) else {}
             content = str(data.get("text") or msg_obj.get("content") or "").strip()
+            content = _strip_bot_mentions(content)
 
             if not content:
                 print(f"[Fxiaoke] empty/non-text message: id={message_id} type={data.get('message_type') or msg_obj.get('type')}")

@@ -439,6 +439,7 @@ fxiaoke_base_url = "https://open.fxiaoke.com"
 fxiaoke_app_id = "YOUR_GATEWAY_APP_ID"
 fxiaoke_app_secret = "YOUR_GATEWAY_APP_SECRET"
 fxiaoke_allowed_users = ["YOUR_FXIAOKE_USER_ID"]  # 可选；[] 或 ['*'] 允许全部用户
+fxiaoke_bot_names = ["YOUR_BOT_DISPLAY_NAME"]     # 可选；群聊 /命令 前后的 @机器人 名称会被剥离
 ```
 
 启动方式：
