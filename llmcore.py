@@ -374,14 +374,14 @@ def _stream_with_retry(sess, url, headers, payload, parse_fn):
                     while True: streamed = True; yield next(gen)
                 except StopIteration as e: return e.value or []
         except (requests.Timeout, requests.ConnectionError) as e:
-            if attempt < sess.max_retries and not streamed:
+            err = f"!!!Error: {type(e).__name__}"
+            if attempt < sess.max_retries:
                 d = _delay(None, attempt)
                 print(f"[LLM Retry] {type(e).__name__}, retry in {d:.1f}s ({attempt+1}/{sess.max_retries+1})")
-                time.sleep(d); continue
-            err = f"!!!Error: {type(e).__name__}"
+                yield err; time.sleep(d); continue
             yield err; return [{"type": "text", "text": err}]
         except Exception as e:
-            err = f"!!!Error: {type(e).__name__}: {e}"
+            err = f"\n\n[!!! 流异常中断 {type(e).__name__}: {e} !!!]" if streamed else f"!!!Error: {type(e).__name__}: {e}"
             yield err; return [{"type": "text", "text": err}]
 
 def _openai_stream(sess, messages):
@@ -618,6 +618,8 @@ def _fix_messages(messages):
             has = {b.get('tool_use_id') for b in _wrap(m['content']) if isinstance(b, dict) and b.get('type') == 'tool_result'}
             miss = [uid for uid in uses if uid not in has]
             if miss: m = {**m, 'content': [{"type": "tool_result", "tool_use_id": uid, "content": "(error)"} for uid in miss] + _wrap(m['content'])}
+            orphan = has - set(uses)
+            if orphan: m = {**m, 'content': [{"type":"text","text":str(b.get('content',''))} if isinstance(b,dict) and b.get('type')=='tool_result' and b.get('tool_use_id') in orphan else b for b in _wrap(m['content'])]}
         fixed.append(m)
     while fixed and fixed[0]['role'] != 'user': fixed.pop(0)
     return fixed
@@ -746,19 +748,6 @@ class ToolClient:
         _write_llm_log('Response', raw_text)
         return self._parse_mixed_response(raw_text)
 
-    def _estimate_content_len(self, content):
-        if isinstance(content, str): return len(content)
-        if isinstance(content, list):
-            total = 0
-            for part in content:
-                if not isinstance(part, dict): continue
-                if part.get("type") == "text":
-                    total += len(part.get("text", ""))
-                elif part.get("type") == "image_url":
-                    total += 1000
-            return total
-        return len(str(content))
-    
     def _prepare_tool_instruction(self, tools):
         tool_instruction = ""
         if not tools: return tool_instruction
@@ -799,61 +788,48 @@ Follow these steps to think and act:
             user += f"=== {role} ===\n"
             for tr in m.get('tool_results', []): user += f'<tool_result>{tr["content"]}</tool_result>\n'
             user += str(m['content']) + "\n"
-            self.total_cd_tokens += self._estimate_content_len(user)           
+            self.total_cd_tokens += len(user) // 3
         if self.total_cd_tokens > 9000: self.last_tools = ''
         user += "=== ASSISTANT ===\n" 
         return system + user
 
     def _parse_mixed_response(self, text):
         remaining_text = text; thinking = ''
-        think_pattern = r"<think(?:ing)?>(.*?)</think(?:ing)?>"
-        think_match = re.search(think_pattern, text, re.DOTALL)
-        
+        think_match = re.search(r"<think(?:ing)?>(.*?)</think(?:ing)?>", text, re.DOTALL)
         if think_match:
             thinking = think_match.group(1).strip()
-            remaining_text = re.sub(think_pattern, "", remaining_text, flags=re.DOTALL)
-        
-        tool_calls = []; json_strs = []; errors = []
-        tool_pattern = r"<(?:tool_use|tool_call)>((?:(?!<(?:tool_use|tool_call)>).){15,}?)</(?:tool_use|tool_call)>"
-        tool_all = re.findall(tool_pattern, remaining_text, re.DOTALL)
-        
-        if tool_all:
-            tool_all = [s.strip() for s in tool_all]
-            json_strs.extend([s for s in tool_all if s.startswith('{') and s.endswith('}')])
-            remaining_text = re.sub(tool_pattern, "", remaining_text, flags=re.DOTALL)
-        elif '<tool_use>' in remaining_text:
-            weaktoolstr = remaining_text.split('<tool_use>')[-1].strip().strip('><')
-            json_str = weaktoolstr if weaktoolstr.endswith('}') else ''
-            if json_str == '' and '```' in weaktoolstr and weaktoolstr.split('```')[0].strip().endswith('}'):
-                json_str = weaktoolstr.split('```')[0].strip()
-            if json_str:
-                json_strs.append(json_str)
-            remaining_text = remaining_text.replace('<tool_use>'+weaktoolstr, "")
-        elif '"name":' in remaining_text and '"arguments":' in remaining_text:
-            json_match = re.search(r'\{.*"name":.*\}', remaining_text, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(0).strip()
-                json_strs.append(json_str)
-                remaining_text = remaining_text.replace(json_str, "").strip()
-
-        for json_str in json_strs:
-            try:
-                data = tryparse(json_str)
-                func_name = data.get('name') or data.get('function') or data.get('tool')
-                args = data.get('arguments') or data.get('args') or data.get('params') or data.get('parameters')
-                if args is None: args = data
-                if func_name: tool_calls.append(MockToolCall(func_name, args))
-            except json.JSONDecodeError as e:
-                errors.append({'err': f"[Warn] Failed to parse tool_use JSON: {json_str}", 'bad_json': f'Failed to parse tool_use JSON: {json_str[:200]}'})
-                self.last_tools = ''   # llm肯定忘了tool schema了，再提供下
-            except Exception as e:
-                errors.append({'err': f'[Warn] Exception during tool_use parsing: {str(e)} {str(data)}'})
-        if len(tool_calls) == 0:
-            for e in errors:
-                print(e['err'])
-                if 'bad_json' in e: tool_calls.append(MockToolCall('bad_json', {'msg': e['bad_json']}))
-        content = remaining_text.strip()
-        return MockResponse(thinking, content, tool_calls, text)
+            remaining_text = re.sub(r"<think(?:ing)?>(.*?)</think(?:ing)?>", "", remaining_text, flags=re.DOTALL)
+        tool_calls, remaining_text = _parse_text_tool_calls(remaining_text)
+        if not tool_calls:
+            json_strs = []; errors = []
+            if '<tool_use>' in remaining_text:
+                weaktoolstr = remaining_text.split('<tool_use>')[-1].strip().strip('><')
+                json_str = weaktoolstr if weaktoolstr.endswith('}') else ''
+                if json_str == '' and '```' in weaktoolstr and weaktoolstr.split('```')[0].strip().endswith('}'):
+                    json_str = weaktoolstr.split('```')[0].strip()
+                if json_str: json_strs.append(json_str)
+                remaining_text = remaining_text.replace('<tool_use>'+weaktoolstr, "")
+            elif '"name":' in remaining_text and '"arguments":' in remaining_text:
+                json_match = re.search(r'\{.*"name":.*\}', remaining_text, re.DOTALL)
+                if json_match:
+                    json_strs.append(json_match.group(0).strip())
+                    remaining_text = remaining_text.replace(json_match.group(0), "").strip()
+            for json_str in json_strs:
+                try:
+                    data = tryparse(json_str)
+                    func_name = data.get('name') or data.get('function') or data.get('tool')
+                    args = data.get('arguments') or data.get('args') or data.get('params') or data.get('parameters')
+                    if args is None: args = data
+                    if func_name: tool_calls.append(MockToolCall(func_name, args))
+                except json.JSONDecodeError:
+                    errors.append(f'Failed to parse tool_use JSON: {json_str[:200]}')
+                    self.last_tools = ''
+                except: pass
+            if not tool_calls:
+                for e in errors:
+                    print(f"[Warn] {e}")
+                    tool_calls.append(MockToolCall('bad_json', {'msg': e}))
+        return MockResponse(thinking, remaining_text.strip(), tool_calls, text)
 
 def _parse_text_tool_calls(content):
     """Fallback: extract tool calls from text when model doesn't use native tool_use blocks."""
