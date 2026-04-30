@@ -1,4 +1,4 @@
-import asyncio, json, os, random, re, sys, threading, time
+import asyncio, json, os, queue as Q, random, re, sys, threading, time
 from typing import Dict, Optional
 from urllib.parse import urlencode
 
@@ -6,7 +6,7 @@ import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agentmain import GeneraticAgent
-from chatapp_common import AgentChatMixin, ensure_single_instance, public_access, redirect_log, require_runtime, split_text
+from chatapp_common import AgentChatMixin, FILE_HINT, build_done_text, clean_reply, ensure_single_instance, public_access, redirect_log, require_runtime, split_text
 from llmcore import mykeys
 
 # ── Config ──────────────────────────────────────────────────────────
@@ -20,6 +20,40 @@ READ_TIMEOUT = int(mykeys.get("fxiaoke_read_timeout", 90) or 90)
 BOT_MENTION_NAMES = {str(x).strip().lstrip("@").casefold() for x in mykeys.get("fxiaoke_bot_names", []) if str(x).strip()}
 
 MENTION_RE = re.compile(r"@[^\s@]+")
+
+# ── Progress/final text helpers (fxiaoke-local) ────────────────────
+_TURN_SPLIT_RE = re.compile(r'(\**LLM Running \(Turn \d+\) \.\.\.\**)')
+_TURN_MARK_RE = re.compile(r'^\s*\**LLM Running \(Turn \d+\) \.\.\.\**\s*$', re.M)
+_TOOL_LINE_RE = re.compile(r'^(\s*🛠️\s*[A-Za-z_][A-Za-z0-9_]*)\((.*)\)\s*$', re.M)
+_TOOL_LINE_FINAL_RE = re.compile(r'^\s*🛠️\s*[A-Za-z_][A-Za-z0-9_]*\(.*\)\s*$', re.M)
+
+
+def _compress_tool_line(m: re.Match) -> str:
+    head, args = m.group(1), m.group(2)
+    args = re.sub(r'\s+', ' ', args).strip()
+    if len(args) > 120:
+        args = args[:117] + '...'
+    return f"{head}({args})"
+
+
+def _clean_final(t: str) -> str:
+    t = _TURN_MARK_RE.sub('', t or '')
+    t = _TOOL_LINE_FINAL_RE.sub('', t)
+    return clean_reply(t)
+
+
+def _clean_progress(t: str) -> str:
+    t = clean_reply(t or '')
+    return _TOOL_LINE_RE.sub(_compress_tool_line, t).strip()
+
+
+def _turn_parts(t: str):
+    parts = _TURN_SPLIT_RE.split(t or '')
+    if len(parts) < 4:
+        return [], (t or '')
+    turns = [parts[i] + (parts[i + 1] if i + 1 < len(parts) else '') for i in range(1, len(parts), 2)]
+    head = [parts[0]] if parts[0].strip() else []
+    return head + turns[:-1], turns[-1]
 
 
 def _strip_bot_mentions(content: str) -> str:
@@ -167,6 +201,78 @@ class FxiaokeApp(AgentChatMixin):
             except Exception as e:
                 print(f"[Fxiaoke] send error: {e}")
                 break
+
+    # ── Stream-style run_agent (overrides mixin default) ──────────────
+    async def run_agent(self, chat_id, text, **ctx):
+        state = {"running": True}
+        self.user_tasks[chat_id] = state
+        sent_turns = 0
+        progress_cnt = 0
+        last_send = 0.0
+        MAX_PROGRESS = 9
+        AGG_INTERVAL = 60.0  # 第 10 条起，至少隔这么久聚合推一次
+        try:
+            await self.send_text(chat_id, "思考中...", **ctx)
+            dq = self.agent.put_task(f"{FILE_HINT}\n\n{text}", source=self.source)
+
+            async def _push_progress(chunk: str) -> bool:
+                nonlocal progress_cnt, last_send
+                s = (chunk or '').strip()
+                if not s:
+                    return False
+                now = time.time()
+                if progress_cnt < MAX_PROGRESS:
+                    # 前 9 条：6*n 秒节流
+                    if progress_cnt and now - last_send < 6 * progress_cnt:
+                        return False
+                    await self.send_text(chat_id, s[:self.split_limit], **ctx)
+                    progress_cnt += 1
+                    last_send = now
+                    return True
+                # 超过上限：聚合心跳，每 AGG_INTERVAL 秒发一条合并简报
+                if now - last_send < AGG_INTERVAL:
+                    return False
+                await self.send_text(chat_id, s[:self.split_limit], **ctx)
+                last_send = now
+                return True
+
+            result = ''
+            while state["running"]:
+                try:
+                    item = await asyncio.to_thread(dq.get, True, 3)
+                except Q.Empty:
+                    continue
+                if 'done' in item:
+                    result = item.get('done', '')
+                    break
+                raw = item.get('next', '')
+                done_turns, _partial = _turn_parts(raw)
+                if len(done_turns) > sent_turns:
+                    merged = _clean_progress('\n\n'.join(done_turns[sent_turns:]))
+                    if await _push_progress(merged):
+                        sent_turns = len(done_turns)
+
+            if not state["running"]:
+                return await self.send_text(chat_id, "⏹️ 已停止", **ctx)
+
+            # Flush any remaining completed turns as a compact progress message.
+            done_turns, _partial = _turn_parts(result)
+            if len(done_turns) > sent_turns:
+                merged = _clean_progress('\n\n'.join(done_turns[sent_turns:]))
+                if merged:
+                    await _push_progress(merged)
+
+            # Final body: strip all process markers, then let build_done_text
+            # append [FILE:...] attachments.
+            final_with_files = build_done_text(_clean_final(result))
+            await self.send_text(chat_id, final_with_files or "...", **ctx)
+        except Exception as e:
+            import traceback
+            print(f"[{self.label}] run_agent error: {e}")
+            traceback.print_exc()
+            await self.send_text(chat_id, f"❌ 错误: {e}", **ctx)
+        finally:
+            self.user_tasks.pop(chat_id, None)
 
     # ── SSE parsing ──────────────────────────────────────────────────
     def _parse_sse_stream(self, resp):
