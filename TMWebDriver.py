@@ -204,7 +204,8 @@ class TMWebDriver:
                     raise ValueError(f"会话ID {session_id} 未连接")  
 
         tp = session.type
-        assert tp in ['ws', 'http', 'ext_ws'], f"Unsupported session type: {tp}"
+        if tp not in ('ws', 'http', 'ext_ws'):
+            raise ValueError(f"Unsupported session type: {tp}")
         exec_id = str(uuid.uuid4())  
         payload_dict = {'id': exec_id, 'code': code}
         if tp == 'ext_ws': payload_dict['tabId'] = int(session.id)
@@ -243,7 +244,7 @@ class TMWebDriver:
         return rr
     
     def _remote_cmd(self, cmd):
-        try: return requests.post(self.remote, headers={"Content-Type": "application/json"}, json=cmd).json()
+        try: return requests.post(self.remote, headers={"Content-Type": "application/json"}, json=cmd, timeout=30).json()
         except (ConnectionError, requests.exceptions.ConnectionError):
             raise ConnectionError("TMWebDriver master未运行，看tmwebdriver_sop启动master")
 
@@ -279,9 +280,6 @@ class TMWebDriver:
         return self.default_session_id  
     
     def jump(self, url, timeout=10): self.execute_js(f"window.location.href='{url}'", timeout=timeout)
-    def newtab(self, url=None):
-        if url is None: url = "http://www.baidu.com/robots.txt"
-        return self.execute_js(f'GM_openInTab("{url}");')
     
 if __name__ == "__main__":
     driver = TMWebDriver(host='127.0.0.1', port=18765)
