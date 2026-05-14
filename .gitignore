@@ -59,6 +59,9 @@ memory/L4_raw_sessions/*
 # TMWebDriver SOP
 !memory/tmwebdriver_sop.md
 
+# Vue3 Component SOP
+!memory/vue3_component_sop.md
+
 # Subagent SOP
 !memory/subagent_sop.md
 
@@ -67,6 +70,9 @@ memory/L4_raw_sessions/*
 
 # Plan SOP
 !memory/plan_sop.md
+
+# Goal Mode SOP
+!memory/goal_mode_sop.md
 
 # Skill Search SOP
 !memory/skill_search/
@@ -88,6 +94,9 @@ memory/L4_raw_sessions/*
 # Memory management
 !memory/memory_cleanup_sop.md
 
+# Code Review Principles
+!memory/code_review_principles.md
+
 # Visual Studio
 .vs/
 restore_commit.txt
@@ -102,6 +111,10 @@ assets/copilot_proxy.pyw
 reflect/*
 !reflect/autonomous.py
 !reflect/scheduler.py
+!reflect/agent_team_worker.py
+!reflect/goal_mode.py
 
 # Universal: never track __pycache__ anywhere
 **/__pycache__/
+
+.claude/

@@ -88,18 +88,19 @@ def safeprint(*argv):
 print = safeprint
 
 def trim_messages_history(history, context_win):
+    cap = context_win * 3
+    target = int(cap * 0.6)
+    def cost(): return sum(len(json.dumps(m, ensure_ascii=False)) for m in history)
     compress_history_tags(history)
-    cost = sum(len(json.dumps(m, ensure_ascii=False)) for m in history) 
-    print(f'[Debug] Current context: {cost} chars, {len(history)} messages.')
-    if cost > context_win * 3: 
-        compress_history_tags(history, keep_recent=4, force=True)   # trim breaks cache, so compress more btw
-        target = context_win * 3 * 0.6
-        while len(history) > 5 and cost > target:
-            history.pop(0)
-            while history and history[0].get('role') != 'user': history.pop(0)
-            if history and history[0].get('role') == 'user': history[0] = _sanitize_leading_user_msg(history[0])
-            cost = sum(len(json.dumps(m, ensure_ascii=False)) for m in history)
-        print(f'[Debug] Trimmed context, current: {cost} chars, {len(history)} messages.')
+    print(f'[Debug] Current context: {cost()} chars, {len(history)} messages.')
+    if cost() <= cap: return
+    compress_history_tags(history, keep_recent=4, force=True)
+    if cost() <= target: return
+    while len(history) > 9 and cost() > target:
+        history.pop(0)
+        while history and history[0].get('role') != 'user': history.pop(0)
+        if history and history[0].get('role') == 'user': history[0] = _sanitize_leading_user_msg(history[0])
+    print(f'[Debug] Trimmed context, current: {cost()} chars, {len(history)} messages.')
 
 def auto_make_url(base, path):
     b, p = base.rstrip('/'), path.strip('/')
@@ -372,7 +373,9 @@ def _stream_with_retry(sess, url, headers, payload, parse_fn):
                 gen = parse_fn(r)
                 try:
                     while True: streamed = True; yield next(gen)
-                except StopIteration as e: return e.value or []
+                except StopIteration as e:
+                    if not e.value and not streamed: raise requests.ConnectionError("empty response")
+                    return e.value or []
         except (requests.Timeout, requests.ConnectionError) as e:
             err = f"!!!Error: {type(e).__name__}"
             if attempt < sess.max_retries:
@@ -479,9 +482,8 @@ def _msgs_claude2oai(messages):
             m = {"role": "assistant"}
             if reasoning: m["reasoning_content"] = reasoning
             if text_parts: m["content"] = text_parts
-            else: m["content"] = ""
+            elif not tool_calls: m["content"] = "."
             if tool_calls: m["tool_calls"] = tool_calls
-            if not text_parts and not tool_calls and reasoning: m["content"] = "."
             result.append(m)
         elif role == "user":
             text_parts = []
@@ -511,7 +513,7 @@ class BaseSession:
         self.api_key = cfg['apikey']
         self.api_base = cfg['apibase'].rstrip('/')
         self.model = cfg.get('model', '')
-        self.context_win = cfg.get('context_win', 28000)
+        self.context_win = cfg.get('context_win', 30000)
         self.history = []
         self.lock = threading.Lock()
         self.system = ""
@@ -563,7 +565,7 @@ class BaseSession:
                 if block.get('type', '') == 'tool_use':
                     tu = {'name': block.get('name', ''), 'arguments': block.get('input', {})}
                     yield f'<tool_use>{json.dumps(tu, ensure_ascii=False)}</tool_use>'
-            if not content.startswith("!!!Error:"): self.history.append({"role": "assistant", "content": [{"type": "text", "text": content}]})
+            if content.strip() and not content.startswith("!!!Error:"): self.history.append({"role": "assistant", "content": [{"type": "text", "text": content}]})
         return _ask_gen() if self.stream else ''.join(list(_ask_gen()))
 
 def _keep_claude_block(b): return not isinstance(b, dict) or b.get("type") != "thinking" or b.get("signature")
@@ -586,6 +588,7 @@ def _ensure_thinking_blocks(messages, model):
 
 class ClaudeSession(BaseSession):
     def raw_ask(self, messages):
+        messages = _fix_messages(messages)
         if self.max_tokens is None: self.max_tokens = 8192
         headers = {"x-api-key": self.api_key, "Content-Type": "application/json", "anthropic-version": "2023-06-01", "anthropic-beta": "prompt-caching-2024-07-31"}
         payload = {"model": self.model, "messages": messages, "max_tokens": self.max_tokens, "stream": self.stream}
@@ -604,7 +607,7 @@ class ClaudeSession(BaseSession):
 
 class LLMSession(BaseSession):
     def raw_ask(self, messages): return (yield from _openai_stream(self, messages))
-    def make_messages(self, raw_list): return _msgs_claude2oai(raw_list)
+    def make_messages(self, raw_list): return _msgs_claude2oai(_fix_messages(raw_list))
 
 def _fix_messages(messages):
     """修复 messages 符合 Claude API：交替、tool_use/tool_result 配对"""
@@ -734,6 +737,7 @@ class ToolClient:
         self.last_tools = ''
         self.name = self.backend.name
         self.total_cd_tokens = 0
+        self.log_path = None
 
     def chat(self, messages, tools=None):
         tools = json.loads(json.dumps(tools, ensure_ascii=False)) if tools else tools
@@ -748,11 +752,11 @@ class ToolClient:
         full_prompt = self._build_protocol_prompt(messages, tools)
         print("Full prompt length:", len(full_prompt), 'chars')
         gen = self.backend.ask(full_prompt)
-        _write_llm_log('Prompt', full_prompt)
+        _write_llm_log('Prompt', full_prompt, self.log_path)
         raw_text = ''
         for chunk in gen:
             raw_text += chunk; yield chunk
-        _write_llm_log('Response', raw_text)
+        _write_llm_log('Response', raw_text, self.log_path)
         return self._parse_mixed_response(raw_text)
 
     def _prepare_tool_instruction(self, tools):
@@ -869,10 +873,10 @@ def _ensure_text_block(blocks):
     blocks.insert(1, {"type": "text", "text": txt})
     return txt
 
-def _write_llm_log(label, content):
-    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp/model_responses')
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, f'model_responses_{os.getpid()}.txt')
+def _write_llm_log(label, content, log_path=None):
+    if not log_path:
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f'temp/model_responses/model_responses_{os.getpid()}.txt')
+    os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
     ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     with open(log_path, 'a', encoding='utf-8', errors='replace') as f:
         f.write(f"=== {label} === {ts}\n{content}\n\n")
@@ -968,6 +972,7 @@ class NativeToolClient:
         self.backend.system = self._thinking_prompt()
         self.name = self.backend.name
         self._pending_tool_ids = []
+        self.log_path = None
     def set_system(self, extra_system):
         combined = f"{extra_system}\n\n{self._thinking_prompt()}" if extra_system else self._thinking_prompt()
         if combined != self.backend.system: print(f"[Debug] Updated system prompt, length {len(combined)} chars.")
@@ -992,13 +997,33 @@ class NativeToolClient:
         for tid in self._pending_tool_ids:
             if tid not in tr_id_set: tool_result_blocks.append({"type": "tool_result", "tool_use_id": tid, "content": ""})
         self._pending_tool_ids = []
-        merged = {"role": "user", "content": tool_result_blocks + combined_content}
-        _write_llm_log('Prompt', json.dumps(merged, ensure_ascii=False, indent=2))
+        # Filter whitespace-only text blocks that cause 400 on strict API proxies
+        filtered_content = [c for c in combined_content if c.get("text", "").strip()]
+        final_content = tool_result_blocks + filtered_content
+        if not final_content: final_content = [{"type": "text", "text": "."}]
+        merged = {"role": "user", "content": final_content}
+        _write_llm_log('Prompt', json.dumps(merged, ensure_ascii=False, indent=2), self.log_path)
         gen = self.backend.ask(merged)
         try:
             while True: 
                 chunk = next(gen); yield chunk
         except StopIteration as e: resp = e.value
-        if resp: _write_llm_log('Response', resp.raw)
+        if resp: _write_llm_log('Response', resp.raw, self.log_path)
         if resp and hasattr(resp, 'tool_calls') and resp.tool_calls: self._pending_tool_ids = [tc.id for tc in resp.tool_calls]
         return resp
+
+def resolve_session(cfg_name):
+    cfg = reload_mykeys()[0].get(cfg_name)
+    if not cfg: raise ValueError(f"Config '{cfg_name}' not in mykey")
+    if 'native' in cfg_name: return (NativeClaudeSession if 'claude' in cfg_name else NativeOAISession)(cfg=cfg)
+    if 'claude' in cfg_name: return ClaudeSession(cfg=cfg)
+    return LLMSession(cfg=cfg) if 'oai' in cfg_name else None
+
+def resolve_client(cfg_name):
+    s = resolve_session(cfg_name)
+    return (NativeToolClient(s) if isinstance(s, (NativeClaudeSession, NativeOAISession)) else ToolClient(s)) if s else None
+
+def fast_ask(prompt, cfg_name):
+    sess = resolve_session(cfg_name)
+    if not sess: raise ValueError(f"fast_ask: '{cfg_name}' unsupported")
+    return "".join(sess.raw_ask([{"role": "user", "content": prompt}]))
